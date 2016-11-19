@@ -19,7 +19,6 @@ func mapF(document string, value string) (res []mapreduce.KeyValue) {
 		return !unicode.IsLetter(c)
 	}
 	strs := strings.FieldsFunc(value, f)
-	res = make([]mapreduce.KeyValue, 0)
 	for _, str := range strs {
 		res = append(res, mapreduce.KeyValue{str, strconv.Itoa(1)})
 	}
