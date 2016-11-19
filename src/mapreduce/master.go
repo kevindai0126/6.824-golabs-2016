@@ -16,8 +16,10 @@ type Master struct {
 	registerChannel chan string
 	doneChannel     chan bool
 	workers         []string // protected by the mutex
+	idleChannel 	chan string
 
-	// Per-task information
+
+// Per-task information
 	jobName string   // Name of currently executing job
 	files   []string // Input files
 	nReduce int      // Number of reduce partitions
@@ -47,6 +49,8 @@ func newMaster(master string) (mr *Master) {
 	mr.shutdown = make(chan struct{})
 	mr.registerChannel = make(chan string)
 	mr.doneChannel = make(chan bool)
+	mr.idleChannel = make(chan string)
+
 	return
 }
 
