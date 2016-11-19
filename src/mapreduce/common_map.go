@@ -2,6 +2,10 @@ package mapreduce
 
 import (
 	"hash/fnv"
+	"log"
+	"os"
+	"fmt"
+	"encoding/json"
 )
 
 // doMap does the job of a map worker: it reads one of the input files
@@ -40,6 +44,45 @@ func doMap(
 	//     err := enc.Encode(&kv)
 	//
 	// Remember to close the file after you have written all the values!
+	file, err := os.Open(inFile)
+	if err != nil {
+		log.Fatal("DoMap: ", err)
+	}
+	fi, err := file.Stat()
+	if err != nil {
+		log.Fatal("DoMap: ", err)
+	}
+	size := fi.Size()
+	fmt.Printf("DoMap: read split %s %d\n", inFile, size)
+	b := make([]byte, size)
+	_, err = file.Read(b)
+	if err != nil {
+		log.Fatal("DoMap: ", err)
+	}
+	file.Close()
+	res := mapF(inFile, string(b))
+	var reduceFiles = make([]*os.File, nReduce)
+
+	for r := 0; r < nReduce; r++ {
+		file, err = os.Create(reduceName(jobName, mapTaskNumber, r))
+		if err != nil {
+			log.Fatal("DoMap: create ", err)
+		}
+		reduceFiles[r] = file
+	}
+
+	for _, kv := range res {
+		index := ihash(kv.Key)%uint32(nReduce)
+		enc := json.NewEncoder(reduceFiles[index])
+		err := enc.Encode(&kv)
+		if err != nil {
+			log.Fatal("DoMap: marshall ", err)
+		}
+	}
+
+	for r := 0; r < nReduce; r++ {
+		reduceFiles[r].Close()
+	}
 }
 
 func ihash(s string) uint32 {
