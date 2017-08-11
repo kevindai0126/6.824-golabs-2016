@@ -189,7 +189,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	var lastIndex = rf.log[len(rf.log)-1].Index
 	var lastTerm = rf.log[len(rf.log)-1].Term
 
-	var logIsLatest = args.LastLogTerm >= lastTerm || ((lastTerm == args.LastLogTerm) && (lastIndex <= args.LastLogIndex))
+	var logIsLatest = args.LastLogTerm > lastTerm || ((lastTerm == args.LastLogTerm) && (lastIndex <= args.LastLogIndex))
 	var isFirstVote = rf.votedFor == -1 || rf.votedFor == args.CandidateId
 
 	if logIsLatest && isFirstVote {
