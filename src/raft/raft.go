@@ -22,6 +22,8 @@ import (
 	"labrpc"
 	"math/rand"
 	"time"
+	"bytes"
+	"encoding/gob"
 )
 
 // import "bytes"
@@ -108,12 +110,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here.
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -122,10 +125,11 @@ func (rf *Raft) persist() {
 func (rf *Raft) readPersist(data []byte) {
 	// Your code here.
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.log)
 }
 
 //
@@ -171,6 +175,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	reply.VoteGranted = false
 	if args.Term < rf.currentTerm {
@@ -206,6 +211,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	// Your code here.
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	reply.Success = false
 
@@ -274,6 +280,7 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	if ok {
 		if rf.state != STATE_CANDIDATE {
@@ -307,6 +314,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	if ok {
 		if rf.state != STATE_LEADER {
@@ -418,6 +426,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		index = rf.log[len(rf.log)-1].Index + 1
 		rf.log = append(rf.log, LogEntry{Term: term, Index: index, Cmd: command})
+		rf.persist()
 		//println("start index:", index, "log len ", len(rf.log))
 		go rf.sendHeartbeat()
 	}
@@ -491,6 +500,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.currentTerm++
 				rf.votedFor = rf.me
 				rf.voteCount = 1
+				rf.persist()
 				rf.mu.Unlock()
 
 				var args RequestVoteArgs
