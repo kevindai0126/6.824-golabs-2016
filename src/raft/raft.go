@@ -19,11 +19,11 @@ package raft
 
 import "sync"
 import (
+	"bytes"
+	"encoding/gob"
 	"labrpc"
 	"math/rand"
 	"time"
-	"bytes"
-	"encoding/gob"
 )
 
 // import "bytes"
@@ -164,8 +164,9 @@ type AppendEntriesArgs struct {
 
 type AppendEntriesReply struct {
 	// Your data here.
-	Term    int
-	Success bool
+	Term      int
+	Success   bool
+	NextIndex int
 }
 
 //
@@ -217,6 +218,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
+		reply.NextIndex = rf.getLastIndex() + 1
 		return
 	}
 
@@ -231,17 +233,25 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	reply.Term = args.Term
 
 	if args.PrevLogIndex > rf.getLastIndex() {
+		reply.NextIndex = rf.getLastIndex() + 1
 		return
 	}
+
+	term := rf.log[args.PrevLogIndex].Term
 
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		for i := args.PrevLogIndex - 1; i >= 0; i-- {
+			if rf.log[i].Term != term {
+				reply.NextIndex = i + 1
+				break
+			}
+		}
 		return
 	}
 
-	//println(rf.me, " replicate index", )
-
-	rf.log = rf.log[:args.PrevLogIndex + 1]
+	rf.log = rf.log[:args.PrevLogIndex+1]
 	rf.log = append(rf.log, args.Entries...)
+	reply.NextIndex = rf.getLastIndex() + 1
 	reply.Success = true
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -334,11 +344,11 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 		if reply.Success {
 			if len(args.Entries) > 0 {
 				//println("replicate success for server:",server, "with index:", args.Entries[len(args.Entries)-1].Index)
-				rf.nextIndex[server] = args.Entries[len(args.Entries)-1].Index + 1
+				rf.nextIndex[server] = args.Entries[len(args.Entries) - 1].Index + 1
 				rf.matchIndex[server] = rf.nextIndex[server] - 1
 			}
 		} else {
-			rf.nextIndex[server]--
+			rf.nextIndex[server] = reply.NextIndex
 		}
 
 	}
@@ -377,7 +387,7 @@ func (rf *Raft) sendHeartbeat() {
 
 	//println(N, rf.commitIndex)
 
-	if (N != rf.commitIndex) {
+	if N != rf.commitIndex {
 		rf.commitIndex = N
 		rf.chanCommit <- true
 	}
@@ -424,7 +434,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := rf.state == STATE_LEADER
 
 	if isLeader {
-		index = rf.log[len(rf.log)-1].Index + 1
+		index = rf.getLastIndex() + 1
 		rf.log = append(rf.log, LogEntry{Term: term, Index: index, Cmd: command})
 		rf.persist()
 		//println("start index:", index, "log len ", len(rf.log))
@@ -473,7 +483,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//Channels
 	rf.chanHeartbeat = make(chan bool, 100)
 	rf.chanLeader = make(chan bool, 100)
-	rf.chanCommit = make(chan bool,100)
+	rf.chanCommit = make(chan bool, 100)
 	//rf.chanGrantVote = make(chan bool,100)
 
 	// initialize from state persisted before a crash
@@ -552,7 +562,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case <-rf.chanCommit:
 				rf.mu.Lock()
 				for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-					//println("Commit for sever:", rf.me, "with index:", i)
 					var applyMsg ApplyMsg = ApplyMsg{Index: i, Command: rf.log[i].Cmd}
 					applyCh <- applyMsg
 					rf.lastApplied = i
