@@ -26,6 +26,8 @@ type Op struct {
 	Operator string
 	Key string
 	Value string
+	ClientId int64
+	SerNum int
 }
 
 type RaftKV struct {
@@ -39,6 +41,7 @@ type RaftKV struct {
 	// Your definitions here.
 	db	map[string]string
 	result	map[int]chan Op
+	ack 	map[int64]int
 }
 
 func (kv *RaftKV) ReplicateLog(entry Op) bool {
@@ -66,39 +69,58 @@ func (kv *RaftKV) ReplicateLog(entry Op) bool {
 		return true
 	}
 }
+func (kv *RaftKV) isDedup(clientId int64, serNum int) bool {
+
+	latestNum, ok := kv.ack[clientId]
+
+	if(ok && serNum <= latestNum) {
+		return true
+	} else {
+		return false
+	}
+}
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-
-	entry := Op{Operator:"Get",Key:args.Key}
-
-	ok := kv.ReplicateLog(entry)
-
-	if ok {
-		reply.WrongLeader = false
-		reply.Err = OK
-		kv.mu.Lock()
+	if(kv.isDedup(args.ClientId, args.SerNum)) {
 		reply.Value = kv.db[args.Key]
-		kv.mu.Unlock()
 	} else {
-		reply.WrongLeader = true
+
+		entry := Op{Operator:"Get", Key:args.Key, ClientId:args.ClientId, SerNum:args.SerNum}
+
+		ok := kv.ReplicateLog(entry)
+
+		if ok {
+			reply.WrongLeader = false
+			reply.Err = OK
+			kv.mu.Lock()
+			reply.Value = kv.db[args.Key]
+			kv.ack[args.ClientId] = args.SerNum
+			kv.mu.Unlock()
+		} else {
+			reply.WrongLeader = true
+		}
 	}
 
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-
-	entry := Op{Operator:args.Op, Key:args.Key, Value:args.Value}
-
-	ok := kv.ReplicateLog(entry)
-
-	if ok {
+	if(kv.isDedup(args.ClientId, args.SerNum)) {
 		reply.WrongLeader = false
 		reply.Err = OK
-		//println(args.Op, "Key:", args.Key, "Value:", args.Value)
 	} else {
-		reply.WrongLeader = true
+		entry := Op{Operator:args.Op, Key:args.Key, Value:args.Value, ClientId:args.ClientId, SerNum:args.SerNum}
+
+		ok := kv.ReplicateLog(entry)
+
+		if ok {
+			reply.WrongLeader = false
+			reply.Err = OK
+			//println(args.Op, "Key:", args.Key, "Value:", args.Value)
+		} else {
+			reply.WrongLeader = true
+		}
 	}
 }
 
@@ -139,6 +161,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.db = make(map[string]string)
 	kv.applyCh = make(chan raft.ApplyMsg, 100)
 	kv.result = make(map[int]chan Op)
+	kv.ack = make(map[int64]int)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 
@@ -154,6 +177,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			case "Append":
 				kv.db[op.Key] += op.Value
 			}
+			kv.ack[op.ClientId] = op.SerNum
 			ch, ok := kv.result[msg.Index]
 			if !ok {
 				kv.result[msg.Index] = make(chan Op, 1)
