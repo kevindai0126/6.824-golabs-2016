@@ -63,15 +63,16 @@ func (kv *RaftKV) ReplicateLog(entry Op) bool {
 		case op := <-ch:
 			return op == entry
 		case <-time.After(1000 * time.Millisecond):
-			log.Printf("timeout\n")
+			//log.Printf("timeout\n")
 			return false
 		}
 		return true
 	}
 }
 func (kv *RaftKV) isDedup(clientId int64, serNum int) bool {
-
+	kv.mu.Lock()
 	latestNum, ok := kv.ack[clientId]
+	kv.mu.Unlock()
 
 	if(ok && serNum <= latestNum) {
 		return true
@@ -117,7 +118,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		if ok {
 			reply.WrongLeader = false
 			reply.Err = OK
-			//println(args.Op, "Key:", args.Key, "Value:", args.Value)
+			//println(kv.me, args.Op, "Key:", args.Key, "Value:", args.Value)
 		} else {
 			reply.WrongLeader = true
 		}
@@ -170,13 +171,18 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			msg := <-kv.applyCh
 			op := msg.Command.(Op)
 
-			kv.mu.Lock()
-			switch op.Operator {
-			case "Put":
-				kv.db[op.Key] = op.Value
-			case "Append":
-				kv.db[op.Key] += op.Value
+			if(!kv.isDedup(op.ClientId, op.SerNum)) {
+				//println(kv.me, "Apply:", op.Operator, "Key:", op.Key, "Value:", op.Value)
+				kv.mu.Lock()
+				switch op.Operator {
+				case "Put":
+					kv.db[op.Key] = op.Value
+				case "Append":
+					kv.db[op.Key] += op.Value
+				}
+				kv.mu.Unlock()
 			}
+			kv.mu.Lock()
 			kv.ack[op.ClientId] = op.SerNum
 			ch, ok := kv.result[msg.Index]
 			if !ok {
