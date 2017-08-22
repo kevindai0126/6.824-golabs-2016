@@ -7,6 +7,7 @@ import (
 	"raft"
 	"sync"
 	"time"
+	"bytes"
 )
 
 const Debug = 0
@@ -66,7 +67,6 @@ func (kv *RaftKV) ReplicateLog(entry Op) bool {
 			//log.Printf("timeout\n")
 			return false
 		}
-		return true
 	}
 }
 func (kv *RaftKV) isDedup(clientId int64, serNum int) bool {
@@ -169,28 +169,59 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	go func() {
 		for {
 			msg := <-kv.applyCh
-			op := msg.Command.(Op)
+			if msg.UseSnapshot {
+				var lastIncludedIndex int
+				var lastIncludedTerm int
 
-			if(!kv.isDedup(op.ClientId, op.SerNum)) {
-				//println(kv.me, "Apply:", op.Operator, "Key:", op.Key, "Value:", op.Value)
 				kv.mu.Lock()
-				switch op.Operator {
-				case "Put":
-					kv.db[op.Key] = op.Value
-				case "Append":
-					kv.db[op.Key] += op.Value
+				r := bytes.NewBuffer(msg.Snapshot)
+				d := gob.NewDecoder(r)
+				d.Decode(&lastIncludedIndex)
+				d.Decode(&lastIncludedTerm)
+				kv.db = make(map[string]string)
+				kv.ack = make(map[int64]int)
+				d.Decode(&kv.db)
+				d.Decode(&kv.ack)
+				kv.mu.Unlock()
+			} else {
+				op := msg.Command.(Op)
+
+				if(!kv.isDedup(op.ClientId, op.SerNum)) {
+					//println(kv.me, "Apply:", op.Operator, "Key:", op.Key, "Value:", op.Value)
+					kv.mu.Lock()
+					switch op.Operator {
+					case "Put":
+						kv.db[op.Key] = op.Value
+					case "Append":
+						kv.db[op.Key] += op.Value
+					}
+					kv.ack[op.ClientId] = op.SerNum
+					kv.mu.Unlock()
 				}
+				kv.mu.Lock()
+
+				ch, ok := kv.result[msg.Index]
+				if !ok {
+					kv.result[msg.Index] = make(chan Op, 1)
+				} else {
+					select {
+					case <-ch:
+					default:
+					}
+					ch <- op
+				}
+
+				if kv.maxraftstate != -1 && kv.rf.GetPerisistSize() > maxraftstate {
+					w := new(bytes.Buffer)
+					e := gob.NewEncoder(w)
+					e.Encode(kv.db)
+					e.Encode(kv.ack)
+					data := w.Bytes()
+					go kv.rf.StartSnapshot(data, msg.Index)
+				}
+
 				kv.mu.Unlock()
 			}
-			kv.mu.Lock()
-			kv.ack[op.ClientId] = op.SerNum
-			ch, ok := kv.result[msg.Index]
-			if !ok {
-				kv.result[msg.Index] = make(chan Op, 1)
-			} else {
-				ch <- op
-			}
-			kv.mu.Unlock()
 		}
 	}()
 

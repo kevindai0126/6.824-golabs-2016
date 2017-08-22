@@ -89,6 +89,7 @@ type Raft struct {
 	chanHeartbeat chan bool
 	chanLeader    chan bool
 	chanCommit    chan bool
+	chanApply chan ApplyMsg
 	//chanGrantVote chan bool
 
 	voteCount int
@@ -132,6 +133,64 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.log)
 }
 
+func (rf *Raft) GetPerisistSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) saveSnapshot(lastIncludedIndex int, lastIncludedTerm int, snapshot []byte) {
+	rf.persist()
+
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(lastIncludedIndex)
+	e.Encode(lastIncludedTerm)
+
+	data := w.Bytes()
+	data = append(data, snapshot...)
+	rf.persister.SaveSnapshot(data)
+}
+
+func (rf *Raft) readSnapshot(snapshot []byte) {
+	if len(snapshot) == 0 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := gob.NewDecoder(r)
+
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+
+	d.Decode(&lastIncludedIndex)
+	d.Decode(&lastIncludedTerm)
+
+	rf.commitIndex = lastIncludedIndex
+	rf.lastApplied = lastIncludedIndex
+
+	rf.log = compactLog(lastIncludedIndex, lastIncludedTerm, rf.log)
+
+	msg := ApplyMsg{UseSnapshot: true, Snapshot: snapshot}
+
+	go func() {
+		rf.chanApply <- msg
+	}()
+
+}
+
+func compactLog(lastIncludedIndex int, lastIncludedTerm int, log []LogEntry) []LogEntry {
+	var newLog []LogEntry
+	newLog = append(newLog, LogEntry{Index: lastIncludedIndex, Term: lastIncludedTerm})
+
+	for index := len(log) - 1; index >= 0; index-- {
+		if log[index].Index == lastIncludedIndex && log[index].Term == lastIncludedTerm {
+			newLog = append(newLog, log[index+1:]...)
+			break
+		}
+	}
+
+	return newLog
+}
+
 //
 // example RequestVote RPC arguments structure.
 //
@@ -169,6 +228,19 @@ type AppendEntriesReply struct {
 	NextIndex int
 }
 
+type InstallSnapshotArgs struct {
+	Term int
+	LeaderId int
+	LastIncludedIndex int
+	LastIncludedTerm int
+	Data []byte
+	Done bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 //
 // example RequestVote RPC handler.
 //
@@ -204,8 +276,6 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 	}
-
-	//println(rf.me, " vote for ", rf.votedFor)
 }
 
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -237,22 +307,27 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		return
 	}
 
-	term := rf.log[args.PrevLogIndex].Term
+	startIndex := rf.log[0].Index
 
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		for i := args.PrevLogIndex - 1; i >= 0; i-- {
-			if rf.log[i].Term != term {
-				reply.NextIndex = i + 1
-				break
+	if(args.PrevLogIndex > startIndex) {
+		term := rf.log[args.PrevLogIndex - startIndex].Term
+		if term != args.PrevLogTerm {
+			for i := args.PrevLogIndex - 1; i >= startIndex; i-- {
+				if rf.log[i - startIndex].Term != term {
+					reply.NextIndex = i + 1
+					break
+				}
 			}
+			return
 		}
-		return
 	}
 
-	rf.log = rf.log[:args.PrevLogIndex+1]
-	rf.log = append(rf.log, args.Entries...)
-	reply.NextIndex = rf.getLastIndex() + 1
-	reply.Success = true
+	if (args.PrevLogIndex >= startIndex) {
+		rf.log = rf.log[:args.PrevLogIndex + 1 - startIndex]
+		rf.log = append(rf.log, args.Entries...)
+		reply.NextIndex = rf.getLastIndex() + 1
+		reply.Success = true
+	}
 
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit < rf.getLastIndex() {
@@ -261,11 +336,34 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 			rf.commitIndex = rf.getLastIndex()
 		}
 
-		//println("Follower ",rf.me, " can commit index from ", rf.commitIndex+1, " to ", args.LeaderCommit)
+		//println("AppendEntries", rf.me, rf.commitIndex, args.LeaderCommit, len(rf.log))
 		rf.chanCommit <- true
 	}
 
 	return
+}
+
+func (rf *Raft) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	rf.chanHeartbeat <- true
+	rf.state = STATE_FLLOWER
+	rf.currentTerm = rf.currentTerm
+
+	rf.persister.SaveSnapshot(args.Data)
+	rf.log = compactLog(args.LastIncludedIndex, args.LastIncludedTerm, rf.log)
+	msg := ApplyMsg{UseSnapshot: true, Snapshot: args.Data}
+	rf.lastApplied = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
+
+	rf.persist()
+	rf.chanApply <- msg
 }
 
 //
@@ -343,7 +441,6 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 
 		if reply.Success {
 			if len(args.Entries) > 0 {
-				//println("replicate success for server:",server, "with index:", args.Entries[len(args.Entries)-1].Index)
 				rf.nextIndex[server] = args.Entries[len(args.Entries) - 1].Index + 1
 				rf.matchIndex[server] = rf.nextIndex[server] - 1
 			}
@@ -351,6 +448,24 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 			rf.nextIndex[server] = reply.NextIndex
 		}
 
+	}
+
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int,args InstallSnapshotArgs,reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+
+	if (ok) {
+		if(reply.Term > rf.currentTerm) {
+			rf.currentTerm = reply.Term
+			rf.state = STATE_FLLOWER
+			rf.votedFor = -1
+			return ok
+		}
+
+		rf.nextIndex[server] = args.LastIncludedIndex + 1
+		rf.matchIndex[server] = args.LastIncludedIndex
 	}
 
 	return ok
@@ -369,12 +484,14 @@ func (rf *Raft) sendHeartbeat() {
 	defer rf.mu.Unlock()
 
 	N := rf.commitIndex
+	lastIndex := rf.getLastIndex()
+	startIndex := rf.log[0].Index
 
-	for i := rf.commitIndex + 1; i <= rf.getLastIndex(); i++ {
+	for i := rf.commitIndex + 1; i <= lastIndex; i++ {
 		num := 1
 
 		for index := range rf.peers {
-			if index != rf.me && rf.matchIndex[index] >= i && rf.log[i].Term == rf.currentTerm {
+			if index != rf.me && rf.matchIndex[index] >= i && rf.log[i- startIndex].Term == rf.currentTerm {
 				num++
 			}
 
@@ -385,32 +502,67 @@ func (rf *Raft) sendHeartbeat() {
 		}
 	}
 
-	//println(N, rf.commitIndex)
-
 	if N != rf.commitIndex {
+		//println(rf.me, "commit", rf.commitIndex)
 		rf.commitIndex = N
 		rf.chanCommit <- true
 	}
 
 	for index := range rf.peers {
 		if index != rf.me && rf.state == STATE_LEADER {
-			go func(i int) {
+			if(rf.nextIndex[index] > startIndex) {
 				var args AppendEntriesArgs
-				var reply AppendEntriesReply
-
 				args.LeaderId = rf.me
 				args.Term = rf.currentTerm
-				args.PrevLogIndex = rf.nextIndex[i] - 1
-				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-				args.Entries = make([]LogEntry, len(rf.log[args.PrevLogIndex+1:]))
-				copy(args.Entries, rf.log[args.PrevLogIndex+1:])
+				args.PrevLogIndex = rf.nextIndex[index] - 1
+				args.PrevLogTerm = rf.log[args.PrevLogIndex - startIndex].Term
+				args.Entries = make([]LogEntry, len(rf.log[args.PrevLogIndex + 1 - startIndex:]))
+				copy(args.Entries, rf.log[args.PrevLogIndex + 1 - startIndex:])
 				args.LeaderCommit = rf.commitIndex
+				go func(i int) {
+					var reply AppendEntriesReply
+					rf.sendAppendEntries(i, args, &reply)
+				}(index)
+			}else {
+				var args InstallSnapshotArgs
+				args.Term = rf.currentTerm
+				args.LeaderId = rf.me
+				args.LastIncludedIndex = rf.log[0].Index
+				args.LastIncludedTerm = rf.log[0].Term
+				args.Data = rf.persister.snapshot
 
-				rf.sendAppendEntries(i, args, &reply)
-			}(index)
+				go func(i int) {
+					var reply InstallSnapshotReply
+					rf.sendInstallSnapshot(i, args, &reply)
+				}(index)
+			}
 		}
 	}
 }
+
+func (rf *Raft) StartSnapshot(snapshot []byte, index int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	startIndex := rf.log[0].Index
+	lastIndex := rf.getLastIndex()
+
+
+	if index <= startIndex || index > lastIndex {
+		return
+	}
+
+	var newLog []LogEntry
+	newLog = append(newLog, LogEntry{Index: index, Term: rf.log[index-startIndex].Term})
+	for i := index + 1; i <= lastIndex; i ++{
+		newLog = append(newLog, rf.log[i - startIndex])
+	}
+
+	rf.log = newLog
+
+	rf.saveSnapshot(newLog[0].Index, newLog[0].Term, snapshot)
+}
+
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -437,8 +589,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		index = rf.getLastIndex() + 1
 		rf.log = append(rf.log, LogEntry{Term: term, Index: index, Cmd: command})
 		rf.persist()
-		//println("start index:", index, "log len ", len(rf.log))
-		go rf.sendHeartbeat()
+		//println("Start:",rf.me, index, len(rf.log))
+		//Can't add it need investigate
+		//go rf.sendHeartbeat()
 	}
 
 	return index, term, isLeader
@@ -484,28 +637,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.chanHeartbeat = make(chan bool, 100)
 	rf.chanLeader = make(chan bool, 100)
 	rf.chanCommit = make(chan bool, 100)
-	//rf.chanGrantVote = make(chan bool,100)
+	rf.chanApply = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.readSnapshot(persister.ReadSnapshot())
 
 	go func() {
 		for {
 			switch rf.state {
 			case STATE_FLLOWER:
-				//println("follower:", rf.me, rf.currentTerm)
 				select {
 				case <-rf.chanHeartbeat:
-				//case <-rf.chanGrantVote:
 				case <-time.After(time.Duration(rand.Int63()%333+550) * time.Millisecond):
 					rf.mu.Lock()
-					//println("Time out", rf.me, rf.currentTerm)
 					rf.state = STATE_CANDIDATE
 					rf.mu.Unlock()
 
 				}
 			case STATE_CANDIDATE:
-				//println("candidate:", rf.me, rf.currentTerm)
 				rf.mu.Lock()
 				rf.currentTerm++
 				rf.votedFor = rf.me
@@ -548,7 +698,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				case <-time.After(time.Duration(rand.Int63()%333+550) * time.Millisecond):
 				}
 			case STATE_LEADER:
-				//println("leader:", rf.me, rf.currentTerm)
 				rf.sendHeartbeat()
 				time.Sleep(HBINTERVAL)
 			}
@@ -561,9 +710,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			select {
 			case <-rf.chanCommit:
 				rf.mu.Lock()
-				for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-					var applyMsg ApplyMsg = ApplyMsg{Index: i, Command: rf.log[i].Cmd}
-					applyCh <- applyMsg
+				startIndex := rf.log[0].Index
+				var endIndex int
+				if(rf.commitIndex <= rf.getLastIndex()){
+					endIndex = rf.commitIndex
+				}else {
+					endIndex = rf.getLastIndex()
+				}
+				//println("Commit", rf.me, endIndex, len(rf.log))
+				for i := rf.lastApplied + 1; i <= endIndex; i++ {
+					var applyMsg ApplyMsg = ApplyMsg{Index: i, Command: rf.log[i - startIndex].Cmd}
+					rf.chanApply <- applyMsg
 					rf.lastApplied = i
 				}
 				rf.mu.Unlock()
